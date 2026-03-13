@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "hashvault", about = "Resumable file hashing and duplicate detection")]
+#[command(name = "hashgoblin", about = "Resumable file hashing and duplicate detection")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -15,7 +15,7 @@ pub enum Command {
         /// Directory to scan
         path: PathBuf,
         /// SQLite database path
-        #[arg(long, default_value = "hashvault.db")]
+        #[arg(long, default_value = "hashgoblin.db")]
         db: PathBuf,
         /// Number of hashing threads
         #[arg(long, default_value_t = num_cpus())]
@@ -24,7 +24,7 @@ pub enum Command {
     /// Report duplicate files grouped by hash
     Dupes {
         /// SQLite database path
-        #[arg(long, default_value = "hashvault.db")]
+        #[arg(long, default_value = "hashgoblin.db")]
         db: PathBuf,
         /// Minimum file size to consider (bytes)
         #[arg(long, default_value_t = 1)]
@@ -35,19 +35,19 @@ pub enum Command {
         /// SHA-256 hash to search for
         hash: String,
         /// SQLite database path
-        #[arg(long, default_value = "hashvault.db")]
+        #[arg(long, default_value = "hashgoblin.db")]
         db: PathBuf,
     },
     /// Show summary statistics
     Stats {
         /// SQLite database path
-        #[arg(long, default_value = "hashvault.db")]
+        #[arg(long, default_value = "hashgoblin.db")]
         db: PathBuf,
     },
     /// List files marked stale (gone since last scan)
     Stale {
         /// SQLite database path
-        #[arg(long, default_value = "hashvault.db")]
+        #[arg(long, default_value = "hashgoblin.db")]
         db: PathBuf,
     },
 }
