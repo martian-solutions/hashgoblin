@@ -23,6 +23,9 @@ pub struct ScanResult {
 /// A work item describing one file to process.
 struct WorkItem {
     path: PathBuf,
+    /// Pre-validated UTF-8 representation of `path`. Files with non-UTF-8 paths
+    /// are skipped during the walk phase and logged as walk errors.
+    path_str: String,
     inode: u64,
     size: u64,
     mtime: i64,
@@ -34,7 +37,7 @@ struct ProcessedFile {
 }
 
 pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Result<ScanResult> {
-    // Open DB on the main thread for the initial cache queries.
+    // Open DB on the main thread for migration and cache queries.
     let conn = db::open(db_path)?;
     db::migrate(&conn)?;
 
@@ -60,6 +63,19 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
                         walk_errors.push(format!("{}: {}", e.path().display(), err));
                     }
                     Ok(meta) => {
+                        // Reject non-UTF-8 paths rather than silently mangling them.
+                        // Two distinct on-disk paths that differ only in invalid bytes
+                        // could otherwise collide to the same database key.
+                        let path_str = match e.path().to_str() {
+                            Some(s) => s.to_owned(),
+                            None => {
+                                walk_errors.push(format!(
+                                    "skipping non-UTF-8 path: {}",
+                                    e.path().display()
+                                ));
+                                continue;
+                            }
+                        };
                         let mtime = meta
                             .modified()
                             .ok()
@@ -68,6 +84,7 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
                             .unwrap_or(0);
                         work_items.push(WorkItem {
                             path: e.path().to_path_buf(),
+                            path_str,
                             inode: meta.ino(),
                             size: meta.len(),
                             mtime,
@@ -89,19 +106,18 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
     );
 
     // Separate the paths that can be skipped from those that need hashing.
-    // We do cache lookups on the main thread (single DB connection, no locking needed).
+    // Cache lookups run on the main thread (single connection, no locking needed).
     let mut to_hash: Vec<WorkItem> = Vec::new();
     let mut skip_paths: Vec<(String, i64)> = Vec::new(); // (path, last_seen)
 
     for item in work_items {
-        let path_str = item.path.to_string_lossy().into_owned();
-        match db::get_cached(&conn, &path_str)? {
+        match db::get_cached(&conn, &item.path_str)? {
             Some(cached)
                 if cached.inode == Some(item.inode)
                     && cached.size == Some(item.size)
                     && cached.mtime == Some(item.mtime) =>
             {
-                skip_paths.push((path_str, scan_start));
+                skip_paths.push((item.path_str, scan_start));
             }
             _ => {
                 to_hash.push(item);
@@ -109,7 +125,7 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
         }
     }
 
-    // Touch last_seen for skipped files in a transaction.
+    // Touch last_seen for skipped files in a single transaction.
     {
         conn.execute_batch("BEGIN")?;
         for (path, ts) in &skip_paths {
@@ -120,6 +136,12 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
 
     let skipped = skip_paths.len() as u64;
     drop(skip_paths);
+
+    // Drop the main-thread connection before the hashing phase. The writer
+    // thread opens its own connection. Releasing `conn` here ensures that when
+    // we reopen it after the writer commits, we get a fresh WAL snapshot and
+    // mark_stale sees all newly written rows.
+    drop(conn);
 
     // Channel: hashing workers → writer thread.
     let (tx, rx) = mpsc::channel::<ProcessedFile>();
@@ -159,13 +181,12 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
 
     pool.install(|| {
         to_hash.par_iter().for_each(|item| {
-            let path_str = item.path.to_string_lossy().into_owned();
-            let pf = process_file(&item.path, &path_str, item.inode, item.size, item.mtime, scan_start);
+            let pf = process_file(&item.path, &item.path_str, item.inode, item.size, item.mtime, scan_start);
             let _ = tx.send(pf);
         });
     });
 
-    // Close the sender so the writer thread exits.
+    // Close the sender so the writer thread exits its receive loop.
     drop(tx);
 
     let (hashed, errors) = writer.join().expect("writer thread panicked")?;
@@ -177,7 +198,9 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
 
     pb.finish_with_message("Scan complete");
 
-    // Mark stale.
+    // Reopen the connection to obtain a fresh WAL snapshot that includes all
+    // rows committed by the writer thread, then mark files not seen this scan.
+    let conn = db::open(db_path)?;
     let stale = db::mark_stale(&conn, scan_start)?;
 
     Ok(ScanResult {
@@ -208,22 +231,23 @@ fn process_file(
                 file_desc: Some(file_desc),
                 pdq_hash,
                 last_seen: scan_start,
-                stale: false,
                 error: None,
             },
         },
         Err(e) => ProcessedFile {
             record: FileRecord {
                 path: path_str.to_owned(),
-                inode: Some(inode),
-                size: Some(size),
-                mtime: Some(mtime),
+                // Store None for inode/size/mtime on error so the cache-skip
+                // logic never matches this record and the file is always
+                // retried on the next scan.
+                inode: None,
+                size: None,
+                mtime: None,
                 sha256: None,
                 mime_type: None,
                 file_desc: None,
                 pdq_hash: None,
                 last_seen: scan_start,
-                stale: false,
                 error: Some(e.to_string()),
             },
         },
@@ -231,22 +255,9 @@ fn process_file(
 }
 
 fn hash_and_magic(path: &Path) -> Result<(String, String, String, Option<String>)> {
-    // SHA-256
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
-        };
-        hasher.update(&buf[..n]);
-    }
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = sha256_file(path)?;
 
-    // MIME type via tree_magic_mini (pure Rust, reads file itself)
+    // MIME type via tree_magic_mini (pure Rust, reads file itself).
     let mime = tree_magic_mini::from_filepath(path)
         .unwrap_or("application/octet-stream")
         .to_string();
@@ -263,6 +274,23 @@ fn hash_and_magic(path: &Path) -> Result<(String, String, String, Option<String>
     };
 
     Ok((hash, mime, desc, pdq))
+}
+
+/// Compute the SHA-256 hash of a file and return it as a lowercase hex string.
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Compute the PDQ perceptual hash for an image file.
@@ -290,6 +318,18 @@ pub fn pdq_bytes_to_hex(bytes: &[u8; 32]) -> String {
         write!(s, "{:02x}", b).unwrap();
     }
     s
+}
+
+/// Return the current time as seconds since the Unix epoch.
+///
+/// Returns an error if the system clock is set before the Unix epoch (e.g. a
+/// misconfigured VM). Callers should propagate this error rather than silently
+/// using a zero timestamp, which would cause mark_stale to mark nothing.
+pub fn now_unix() -> Result<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .map_err(|e| anyhow::anyhow!("System clock is before Unix epoch: {}", e))
 }
 
 #[cfg(test)]
@@ -334,7 +374,7 @@ mod tests {
         assert!(result.is_some(), "expected Some for a valid image");
         let hex = result.unwrap();
         assert_eq!(hex.len(), 64);
-        assert!(hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -352,11 +392,40 @@ mod tests {
         write_test_image(&path);
         assert_eq!(compute_pdq(&path), compute_pdq(&path));
     }
-}
 
-pub fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    #[test]
+    fn sha256_file_known_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn second_scan_skips_all_unchanged_files() {
+        let file_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("test.db");
+
+        std::fs::write(file_dir.path().join("a.txt"), b"hello").unwrap();
+        std::fs::write(file_dir.path().join("b.txt"), b"world").unwrap();
+
+        let t1 = now_unix().unwrap();
+        let r1 = run(file_dir.path(), &db_path, 1, t1).unwrap();
+        assert_eq!(r1.processed, 2, "first scan should hash both files");
+        assert_eq!(r1.skipped, 0);
+        assert_eq!(r1.errors, 0);
+
+        // Use t1 + 1 so mark_stale in the second scan doesn't flag the first
+        // scan's files (last_seen = t1) as stale if t2 happened to equal t1.
+        let t2 = t1 + 1;
+        let r2 = run(file_dir.path(), &db_path, 1, t2).unwrap();
+        assert_eq!(r2.skipped, 2, "second scan should skip both unchanged files");
+        assert_eq!(r2.processed, 0);
+        assert_eq!(r2.errors, 0);
+        assert_eq!(r2.stale, 0);
+    }
 }

@@ -13,7 +13,6 @@ pub struct FileRecord {
     pub file_desc: Option<String>,
     pub pdq_hash: Option<String>,
     pub last_seen: i64,
-    pub stale: bool,
     pub error: Option<String>,
 }
 
@@ -126,24 +125,42 @@ pub struct DupeGroup {
 }
 
 pub fn query_dupes(conn: &Connection, min_size: u64) -> Result<Vec<DupeGroup>> {
-    let mut stmt = conn.prepare(
-        "SELECT sha256, COUNT(*) as n, GROUP_CONCAT(path, '|'), MAX(size)
+    // Step 1: find sha256 values that appear more than once, ordered by
+    // descending copy count then descending size.
+    let mut meta_stmt = conn.prepare(
+        "SELECT sha256, COUNT(*) as n, MAX(size)
          FROM files
          WHERE sha256 IS NOT NULL AND stale = 0 AND size >= ?1
          GROUP BY sha256
          HAVING n > 1
          ORDER BY n DESC, MAX(size) DESC",
     )?;
-    let rows = stmt.query_map(params![min_size], |row| {
-        let paths_str: String = row.get(2)?;
-        Ok(DupeGroup {
-            sha256: row.get(0)?,
-            count: row.get::<_, u64>(1)?,
-            paths: paths_str.split('|').map(String::from).collect(),
-            size: row.get::<_, Option<u64>>(3)?.unwrap_or(0),
-        })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    let groups_meta: Vec<(String, u64, u64)> = meta_stmt
+        .query_map(params![min_size], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Option<u64>>(2)?.unwrap_or(0),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Step 2: for each group, fetch the individual paths. Using a separate
+    // query per group avoids the GROUP_CONCAT separator-collision bug: any
+    // separator character is a legal part of a Linux filename, but building
+    // a Vec via individual rows is always correct.
+    let mut path_stmt = conn.prepare(
+        "SELECT path FROM files WHERE sha256 = ?1 AND stale = 0 ORDER BY path",
+    )?;
+
+    let mut groups = Vec::with_capacity(groups_meta.len());
+    for (sha256, count, size) in groups_meta {
+        let paths: Vec<String> = path_stmt
+            .query_map(params![sha256], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        groups.push(DupeGroup { sha256, count, paths, size });
+    }
+    Ok(groups)
 }
 
 pub fn query_by_hash(conn: &Connection, hash: &str) -> Result<Vec<String>> {
@@ -248,6 +265,34 @@ pub fn query_similar_pdq(
     Ok(results)
 }
 
+/// Parse a 64-character hex string into 32 bytes.
+fn pdq_hex_to_bytes(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        bytes[i] = (hi << 4) | lo;
+    }
+    Some(bytes)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Count the number of bit positions that differ between two 256-bit PDQ hashes.
+fn hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,7 +315,6 @@ mod tests {
             file_desc: Some("image/png".to_string()),
             pdq_hash: pdq_hash.map(String::from),
             last_seen,
-            stale: false,
             error: None,
         }
     }
@@ -285,7 +329,7 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let conn = setup();
-        migrate(&conn).unwrap(); // second call must not fail
+        migrate(&conn).unwrap();
     }
 
     #[test]
@@ -309,7 +353,6 @@ mod tests {
         let conn = setup();
         upsert(&conn, &make_record("/a", Some("hash1"), None, 1000)).unwrap();
 
-        // Second upsert with different sha256 and pdq_hash.
         let mut updated = make_record("/a", Some("hash2"), Some(ALL_ZEROS), 2000);
         updated.size = Some(999);
         upsert(&conn, &updated).unwrap();
@@ -334,6 +377,16 @@ mod tests {
     }
 
     #[test]
+    fn query_by_hash_is_case_sensitive() {
+        // Documents that SQLite TEXT comparison is case-sensitive: an uppercase
+        // hash never matches a lowercase-stored hash. The fix lives in
+        // commands::find, which normalises input to lowercase before querying.
+        let conn = setup();
+        upsert(&conn, &make_record("/a", Some("deadbeef"), None, 1000)).unwrap();
+        assert!(query_by_hash(&conn, "DEADBEEF").unwrap().is_empty());
+    }
+
+    #[test]
     fn query_dupes_groups_by_hash() {
         let conn = setup();
         upsert(&conn, &make_record("/a", Some("aaa"), None, 1000)).unwrap();
@@ -347,11 +400,26 @@ mod tests {
     }
 
     #[test]
+    fn query_dupes_path_with_pipe_character() {
+        // Regression: the old GROUP_CONCAT('|') approach split incorrectly on
+        // paths that contain '|', a legal Linux filename character.
+        let conn = setup();
+        upsert(&conn, &make_record("/foo/bar|baz.txt", Some("aaa"), None, 1000)).unwrap();
+        upsert(&conn, &make_record("/foo/qux.txt",     Some("aaa"), None, 1000)).unwrap();
+
+        let groups = query_dupes(&conn, 0).unwrap();
+        assert_eq!(groups.len(), 1);
+        let mut paths = groups[0].paths.clone();
+        paths.sort();
+        assert_eq!(paths, vec!["/foo/bar|baz.txt", "/foo/qux.txt"]);
+    }
+
+    #[test]
     fn query_dupes_excludes_stale() {
         let conn = setup();
         upsert(&conn, &make_record("/a", Some("aaa"), None, 100)).unwrap();
         upsert(&conn, &make_record("/b", Some("aaa"), None, 100)).unwrap();
-        mark_stale(&conn, 500).unwrap(); // both files become stale
+        mark_stale(&conn, 500).unwrap();
         assert!(query_dupes(&conn, 0).unwrap().is_empty());
     }
 
@@ -365,6 +433,19 @@ mod tests {
 
         let stale = query_stale(&conn).unwrap();
         assert_eq!(stale, vec!["/old"]);
+    }
+
+    #[test]
+    fn mark_stale_with_zero_scan_start_marks_nothing() {
+        // If now_unix() ever silently returned 0 (e.g. misconfigured clock),
+        // mark_stale would run with scan_start=0. No file has last_seen < 0,
+        // so zero files would be marked stale — a silent no-op. now_unix()
+        // now returns an error in this case, but this test documents the
+        // underlying database behaviour.
+        let conn = setup();
+        upsert(&conn, &make_record("/a", Some("x"), None, 100)).unwrap();
+        let n = mark_stale(&conn, 0).unwrap();
+        assert_eq!(n, 0, "scan_start=0 should mark no files stale");
     }
 
     #[test]
@@ -383,9 +464,7 @@ mod tests {
         let conn = setup();
         upsert(&conn, &make_record("/img", Some("h"), Some(DIST_1), 1000)).unwrap();
 
-        // distance 1, threshold 0 → no match
         assert!(query_similar_pdq(&conn, ALL_ZEROS, 0).unwrap().is_empty());
-        // distance 1, threshold 1 → match
         let r = query_similar_pdq(&conn, ALL_ZEROS, 1).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].distance, 1);
@@ -427,32 +506,4 @@ mod tests {
         assert_eq!(hamming_distance(&zeros, &eight_bits), 8);
         assert_eq!(hamming_distance(&zeros, &all_ones), 256);
     }
-}
-
-/// Parse a 64-character lowercase hex string into 32 bytes.
-fn pdq_hex_to_bytes(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        bytes[i] = (hi << 4) | lo;
-    }
-    Some(bytes)
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Count the number of bit positions that differ between two 256-bit PDQ hashes.
-fn hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x ^ y).count_ones()).sum()
 }

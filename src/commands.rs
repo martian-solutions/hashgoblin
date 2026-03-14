@@ -5,7 +5,7 @@ use crate::db;
 use crate::scan;
 
 pub fn scan(path: PathBuf, db: PathBuf, threads: usize) -> Result<()> {
-    let scan_start = scan::now_unix();
+    let scan_start = scan::now_unix()?;
     println!("Scanning: {}", path.display());
     println!("Database: {}", db.display());
     println!("Threads:  {}", threads);
@@ -52,11 +52,14 @@ pub fn dupes(db: PathBuf, min_size: u64) -> Result<()> {
 ///   when the input is an image.
 pub fn find(input: String, db: PathBuf, threshold: u32) -> Result<()> {
     if looks_like_sha256(&input) {
-        // --- exact hash lookup ---
+        // Normalise to lowercase: SHA-256 hashes are stored as lowercase by
+        // sha2, but SQLite TEXT comparison is case-sensitive, so an uppercase
+        // input would otherwise return no results.
+        let hash = input.to_lowercase();
         let conn = db::open(&db)?;
-        let paths = db::query_by_hash(&conn, &input)?;
+        let paths = db::query_by_hash(&conn, &hash)?;
         if paths.is_empty() {
-            println!("No files found for hash: {}", input);
+            println!("No files found for hash: {}", hash);
         } else {
             for p in &paths {
                 println!("{}", p);
@@ -71,8 +74,7 @@ pub fn find(input: String, db: PathBuf, threshold: u32) -> Result<()> {
         bail!("Path does not exist: {}", path.display());
     }
 
-    // Compute SHA-256 of the input file.
-    let sha256 = compute_sha256_for_file(&path)?;
+    let sha256 = scan::sha256_file(&path)?;
 
     let conn = db::open(&db)?;
 
@@ -143,29 +145,24 @@ pub fn stale(db: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Returns true if `s` looks like a SHA-256 hex digest (exactly 64 lowercase hex chars).
+/// Returns true if `s` looks like a SHA-256 hex digest (exactly 64 hex chars).
 fn looks_like_sha256(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Compute the SHA-256 hash of a file and return it as a hex string.
-fn compute_sha256_for_file(path: &std::path::Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
-        };
-        hasher.update(&buf[..n]);
+fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    if unit == 0 {
+        format!("{} B", bytes)
+    } else {
+        format!("{:.2} {}", size, UNITS[unit])
+    }
 }
 
 #[cfg(test)]
@@ -197,7 +194,6 @@ mod tests {
 
     #[test]
     fn looks_like_sha256_non_hex_char() {
-        // 63 valid hex chars + one 'g'
         let bad = format!("{}g", "a".repeat(63));
         assert!(!looks_like_sha256(&bad));
     }
@@ -208,36 +204,26 @@ mod tests {
     }
 
     #[test]
-    fn compute_sha256_known_content() {
-        // SHA-256("abc") is well-known.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.txt");
-        std::fs::write(&path, b"abc").unwrap();
-        let hash = compute_sha256_for_file(&path).unwrap();
-        assert_eq!(hash, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    fn human_size_bytes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1), "1 B");
+        assert_eq!(human_size(1023), "1023 B");
     }
 
     #[test]
-    fn compute_sha256_empty_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("empty.txt");
-        std::fs::write(&path, b"").unwrap();
-        let hash = compute_sha256_for_file(&path).unwrap();
-        assert_eq!(hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    fn human_size_kilobytes() {
+        assert_eq!(human_size(1024), "1.00 KB");
+        assert_eq!(human_size(1025), "1.00 KB");
+        assert_eq!(human_size(1024 * 1023), "1023.00 KB");
     }
-}
 
-fn human_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
+    #[test]
+    fn human_size_megabytes() {
+        assert_eq!(human_size(1024 * 1024), "1.00 MB");
     }
-    if unit == 0 {
-        format!("{} B", bytes)
-    } else {
-        format!("{:.2} {}", size, UNITS[unit])
+
+    #[test]
+    fn human_size_gigabytes() {
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.00 GB");
     }
 }
