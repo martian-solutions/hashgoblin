@@ -25,6 +25,10 @@ pub struct CachedRecord {
 pub fn open(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+    // Retry for up to 30 s when another connection holds a lock.  Without this,
+    // the default timeout is 0 ms: any concurrent reader (e.g. `sqlite3` in
+    // another terminal) would cause an immediate SQLITE_BUSY failure.
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     Ok(conn)
 }

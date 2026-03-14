@@ -2,7 +2,35 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "hashgoblin", about = "Resumable file hashing and duplicate detection")]
+#[command(
+    name = "hashgoblin",
+    about = "Resumable file hashing and duplicate detection",
+    help_template = "hashgoblin — resumable file hashing and duplicate detection
+
+Usage:
+  hashgoblin scan   <PATH> [--db FILE] [--threads N]
+  hashgoblin dupes  [--db FILE] [--min-size BYTES]
+  hashgoblin find   <HASH|PATH> [--db FILE] [--threshold N]
+  hashgoblin stats  [--db FILE]
+  hashgoblin stale  [--db FILE]
+
+Commands:
+  scan   Walk PATH hashing every file; unchanged files (same inode/size/mtime)
+         are skipped. --threads defaults to CPU count.
+  dupes  Group files that share a SHA-256. --min-size BYTES (default 1) skips
+         smaller files.
+  find   HASH (64 hex chars): exact SHA-256 lookup.
+         PATH: SHA-256 dupes for all files; PDQ perceptual near-dupes for
+         images (Hamming distance <= --threshold bits, default 31).
+  stats  Total files, size, duplicate groups, error count, stale count.
+  stale  Files recorded in the DB but absent from the most recent scan.
+
+  --db FILE defaults to hashgoblin.db in the current directory.
+
+Options:
+  -h, --help  Print this help
+"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
