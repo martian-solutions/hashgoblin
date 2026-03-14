@@ -12,7 +12,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Scan { path, db, threads } => commands::scan(path, db, threads),
         Command::Dupes { db, min_size } => commands::dupes(db, min_size),
-        Command::Find { hash, db } => commands::find(hash, db),
+        Command::Find { input, db, threshold } => commands::find(input, db, threshold),
         Command::Stats { db } => commands::stats(db),
         Command::Stale { db } => commands::stale(db),
     }

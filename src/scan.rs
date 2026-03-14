@@ -2,6 +2,7 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
@@ -196,7 +197,7 @@ fn process_file(
     scan_start: i64,
 ) -> ProcessedFile {
     match hash_and_magic(path) {
-        Ok((sha256, mime_type, file_desc)) => ProcessedFile {
+        Ok((sha256, mime_type, file_desc, pdq_hash)) => ProcessedFile {
             record: FileRecord {
                 path: path_str.to_owned(),
                 inode: Some(inode),
@@ -205,6 +206,7 @@ fn process_file(
                 sha256: Some(sha256),
                 mime_type: Some(mime_type),
                 file_desc: Some(file_desc),
+                pdq_hash,
                 last_seen: scan_start,
                 stale: false,
                 error: None,
@@ -219,6 +221,7 @@ fn process_file(
                 sha256: None,
                 mime_type: None,
                 file_desc: None,
+                pdq_hash: None,
                 last_seen: scan_start,
                 stale: false,
                 error: Some(e.to_string()),
@@ -227,7 +230,7 @@ fn process_file(
     }
 }
 
-fn hash_and_magic(path: &Path) -> Result<(String, String, String)> {
+fn hash_and_magic(path: &Path) -> Result<(String, String, String, Option<String>)> {
     // SHA-256
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -252,7 +255,103 @@ fn hash_and_magic(path: &Path) -> Result<(String, String, String)> {
     // This keeps us dependency-free from libmagic C bindings.
     let desc = mime.clone();
 
-    Ok((hash, mime, desc))
+    // PDQ perceptual hash for images only.
+    let pdq = if mime.starts_with("image/") {
+        compute_pdq(path)
+    } else {
+        None
+    };
+
+    Ok((hash, mime, desc, pdq))
+}
+
+/// Compute the PDQ perceptual hash for an image file.
+///
+/// Returns the hash as a 64-character lowercase hex string, or `None` if the
+/// file cannot be decoded as an image.
+///
+/// The second value returned by `pdqhash::generate_pdq_full_size` is a quality
+/// score (0.0–1.0) that reflects how much gradient/texture information the image
+/// contains. Flat or solid-colour images score near 0.0; richly textured images
+/// score near 1.0. A low quality score means the hash captures less distinctive
+/// information, so similarity matches may be less reliable for such images. We
+/// compute and store the hash regardless of quality — callers can decide how
+/// much weight to give low-quality results.
+pub fn compute_pdq(path: &Path) -> Option<String> {
+    let img = image::open(path).ok()?;
+    let (hash_bytes, _quality) = pdqhash::generate_pdq_full_size(&img);
+    Some(pdq_bytes_to_hex(&hash_bytes))
+}
+
+/// Encode 32 bytes as a 64-character lowercase hex string.
+pub fn pdq_bytes_to_hex(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        write!(s, "{:02x}", b).unwrap();
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, Rgb};
+
+    fn write_test_image(path: &std::path::Path) {
+        // 64×64 RGB gradient — gives PDQ enough texture for a stable hash.
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(64, 64, |x, y| Rgb([(x * 4) as u8, (y * 4) as u8, 128]));
+        img.save(path).unwrap();
+    }
+
+    #[test]
+    fn pdq_bytes_to_hex_all_zeros() {
+        assert_eq!(pdq_bytes_to_hex(&[0u8; 32]), "0".repeat(64));
+    }
+
+    #[test]
+    fn pdq_bytes_to_hex_all_ones() {
+        assert_eq!(pdq_bytes_to_hex(&[0xffu8; 32]), "f".repeat(64));
+    }
+
+    #[test]
+    fn pdq_bytes_to_hex_known_value() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xde;
+        bytes[1] = 0xad;
+        let hex = pdq_bytes_to_hex(&bytes);
+        assert!(hex.starts_with("dead"));
+        assert_eq!(hex.len(), 64);
+    }
+
+    #[test]
+    fn compute_pdq_returns_hash_for_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.png");
+        write_test_image(&path);
+
+        let result = compute_pdq(&path);
+        assert!(result.is_some(), "expected Some for a valid image");
+        let hex = result.unwrap();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    #[test]
+    fn compute_pdq_returns_none_for_non_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"this is not an image").unwrap();
+        assert!(compute_pdq(&path).is_none());
+    }
+
+    #[test]
+    fn compute_pdq_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.png");
+        write_test_image(&path);
+        assert_eq!(compute_pdq(&path), compute_pdq(&path));
+    }
 }
 
 pub fn now_unix() -> i64 {

@@ -16,3 +16,8 @@ rayon = "1"
 tree_magic_mini = "3"
 indicatif = "0.17"
 anyhow = "1"
+image = "0.23"  # must match pdqhash 0.1.1's dependency
+pdqhash = "0.1.1"
+
+[dev-dependencies]
+tempfile = "3"
