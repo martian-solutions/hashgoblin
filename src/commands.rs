@@ -10,7 +10,7 @@ pub fn scan(path: PathBuf, db: PathBuf, threads: usize) -> Result<()> {
     println!("Database: {}", db.display());
     println!("Threads:  {}", threads);
 
-    let result = scan::run(&path, &db, threads, scan_start)?;
+    let result = scan::run(&path, &db, threads, scan_start, None)?;
 
     println!("\nResults:");
     println!("  Hashed:  {}", result.processed);

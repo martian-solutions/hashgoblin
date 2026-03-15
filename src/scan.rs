@@ -7,11 +7,42 @@ use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::db::{self, FileRecord};
+
+/// Real-time progress state for GUI integration.
+/// Uses only std types so it is always compiled regardless of feature flags.
+pub struct ScanProgress {
+    /// "walking" | "hashing" | "done" | "cancelled"
+    pub phase: Mutex<String>,
+    /// Files discovered during the walk phase.
+    pub walk_count: AtomicUsize,
+    /// Total files that need hashing (set just before hashing begins).
+    pub total_to_hash: AtomicUsize,
+    /// Files sent through the hashing pipeline so far.
+    pub hashed_count: AtomicUsize,
+    /// Path of the file currently being processed.
+    pub current_file: Mutex<String>,
+    /// Set to true to request cancellation.
+    pub cancel: AtomicBool,
+}
+
+impl ScanProgress {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            phase: Mutex::new("walking".to_string()),
+            walk_count: AtomicUsize::new(0),
+            total_to_hash: AtomicUsize::new(0),
+            hashed_count: AtomicUsize::new(0),
+            current_file: Mutex::new(String::new()),
+            cancel: AtomicBool::new(false),
+        })
+    }
+}
 
 pub struct ScanResult {
     pub processed: u64,
@@ -36,7 +67,13 @@ struct ProcessedFile {
     record: FileRecord,
 }
 
-pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Result<ScanResult> {
+pub fn run(
+    root: &Path,
+    db_path: &Path,
+    threads: usize,
+    scan_start: i64,
+    progress: Option<Arc<ScanProgress>>,
+) -> Result<ScanResult> {
     // Open DB on the main thread for migration and cache queries.
     let conn = db::open(db_path)?;
     db::migrate(&conn)?;
@@ -49,7 +86,13 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
     let mut work_items: Vec<WorkItem> = Vec::new();
     let mut walk_errors: Vec<String> = Vec::new();
 
-    for entry in WalkDir::new(root).follow_links(false) {
+    'walk: for entry in WalkDir::new(root).follow_links(false) {
+        // Check for cancellation on every walk entry.
+        if let Some(ref p) = progress {
+            if p.cancel.load(Ordering::Relaxed) {
+                break 'walk;
+            }
+        }
         match entry {
             Err(e) => {
                 walk_errors.push(format!("{}", e));
@@ -82,6 +125,9 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
                             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
+                        if let Some(ref p) = progress {
+                            p.walk_count.fetch_add(1, Ordering::Relaxed);
+                        }
                         work_items.push(WorkItem {
                             path: e.path().to_path_buf(),
                             path_str,
@@ -137,6 +183,12 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
     let skipped = skip_paths.len() as u64;
     drop(skip_paths);
 
+    // Update GUI progress: transition to hashing phase.
+    if let Some(ref p) = progress {
+        *p.phase.lock().unwrap() = "hashing".to_string();
+        p.total_to_hash.store(to_hash.len(), Ordering::Relaxed);
+    }
+
     // Drop the main-thread connection before the hashing phase. The writer
     // thread opens its own connection. Releasing `conn` here ensures that when
     // we reopen it after the writer commits, we get a fresh WAL snapshot and
@@ -179,9 +231,19 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
         .num_threads(threads)
         .build()?;
 
+    let progress_for_workers = progress.clone();
     pool.install(|| {
         to_hash.par_iter().for_each(|item| {
+            if let Some(ref p) = progress_for_workers {
+                if p.cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                *p.current_file.lock().unwrap() = item.path_str.clone();
+            }
             let pf = process_file(&item.path, &item.path_str, item.inode, item.size, item.mtime, scan_start);
+            if let Some(ref p) = progress_for_workers {
+                p.hashed_count.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = tx.send(pf);
         });
     });
@@ -197,6 +259,10 @@ pub fn run(root: &Path, db_path: &Path, threads: usize, scan_start: i64) -> Resu
     }
 
     pb.finish_with_message("Scan complete");
+
+    if let Some(ref p) = progress {
+        *p.phase.lock().unwrap() = "done".to_string();
+    }
 
     // Reopen the connection to obtain a fresh WAL snapshot that includes all
     // rows committed by the writer thread, then mark files not seen this scan.
@@ -414,7 +480,7 @@ mod tests {
         std::fs::write(file_dir.path().join("b.txt"), b"world").unwrap();
 
         let t1 = now_unix().unwrap();
-        let r1 = run(file_dir.path(), &db_path, 1, t1).unwrap();
+        let r1 = run(file_dir.path(), &db_path, 1, t1, None).unwrap();
         assert_eq!(r1.processed, 2, "first scan should hash both files");
         assert_eq!(r1.skipped, 0);
         assert_eq!(r1.errors, 0);
@@ -422,7 +488,7 @@ mod tests {
         // Use t1 + 1 so mark_stale in the second scan doesn't flag the first
         // scan's files (last_seen = t1) as stale if t2 happened to equal t1.
         let t2 = t1 + 1;
-        let r2 = run(file_dir.path(), &db_path, 1, t2).unwrap();
+        let r2 = run(file_dir.path(), &db_path, 1, t2, None).unwrap();
         assert_eq!(r2.skipped, 2, "second scan should skip both unchanged files");
         assert_eq!(r2.processed, 0);
         assert_eq!(r2.errors, 0);
