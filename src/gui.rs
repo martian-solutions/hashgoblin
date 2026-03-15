@@ -17,7 +17,6 @@ enum Tab {
     Scan,
     Dupes,
     Find,
-    Stats,
     Stale,
 }
 
@@ -29,7 +28,9 @@ enum ScanStatus {
         progress: Arc<ScanProgress>,
         result_rx: mpsc::Receiver<anyhow::Result<ScanResult>>,
     },
-    Done(ScanResult),
+    /// Scan completed. Second field is the list of (path, error) for files
+    /// that could not be hashed, drawn from the database after the scan.
+    Done(ScanResult, Vec<(String, String)>),
     Error(String),
 }
 
@@ -38,6 +39,8 @@ struct ScanPanel {
     threads: usize,
     status: ScanStatus,
     dir_dialog_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    /// Database statistics shown in the lower half of the Scan tab.
+    stats_status: StatsStatus,
 }
 
 impl ScanPanel {
@@ -50,6 +53,7 @@ impl ScanPanel {
             threads,
             status: ScanStatus::Idle,
             dir_dialog_rx: None,
+            stats_status: StatsStatus::Idle,
         }
     }
 }
@@ -63,15 +67,38 @@ enum DupesStatus {
     Error(String),
 }
 
+#[cfg(feature = "cleanup")]
+enum CleanupStatus {
+    Idle,
+    Running(mpsc::Receiver<anyhow::Result<String>>),
+    Done(String),
+    Error(String),
+}
+
 struct DupesPanel {
     min_size_str: String,
     status: DupesStatus,
     selected_group: Option<usize>,
+    /// Path selected within the currently-shown group (for the footer Open buttons).
+    selected_path: Option<String>,
+    #[cfg(feature = "cleanup")]
+    cleanup_status: CleanupStatus,
+    #[cfg(feature = "cleanup")]
+    cleanup_dialog_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
 }
 
 impl DupesPanel {
     fn new() -> Self {
-        Self { min_size_str: "1".to_string(), status: DupesStatus::Idle, selected_group: None }
+        Self {
+            min_size_str: "1".to_string(),
+            status: DupesStatus::Idle,
+            selected_group: None,
+            selected_path: None,
+            #[cfg(feature = "cleanup")]
+            cleanup_status: CleanupStatus::Idle,
+            #[cfg(feature = "cleanup")]
+            cleanup_dialog_rx: None,
+        }
     }
 }
 
@@ -123,16 +150,6 @@ enum StatsStatus {
     Error(String),
 }
 
-struct StatsPanel {
-    status: StatsStatus,
-}
-
-impl StatsPanel {
-    fn new() -> Self {
-        Self { status: StatsStatus::Idle }
-    }
-}
-
 // ── Stale panel ──────────────────────────────────────────────────────────────
 
 enum StaleStatus {
@@ -161,7 +178,6 @@ pub struct HashGoblinApp {
     scan: ScanPanel,
     dupes: DupesPanel,
     find: FindPanel,
-    stats: StatsPanel,
     stale: StalePanel,
 }
 
@@ -174,7 +190,6 @@ impl HashGoblinApp {
             scan: ScanPanel::new(),
             dupes: DupesPanel::new(),
             find: FindPanel::new(),
-            stats: StatsPanel::new(),
             stale: StalePanel::new(),
         }
     }
@@ -201,9 +216,9 @@ impl eframe::App for HashGoblinApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep repainting while background work is in flight.
         let busy = matches!(self.scan.status, ScanStatus::Running { .. })
+            || matches!(self.scan.stats_status, StatsStatus::Loading(_))
             || matches!(self.dupes.status, DupesStatus::Loading(_))
             || matches!(self.find.status, FindStatus::Loading(_))
-            || matches!(self.stats.status, StatsStatus::Loading(_))
             || matches!(self.stale.status, StaleStatus::Loading(_))
             || self.find.preview_rx.is_some();
         if busy {
@@ -254,7 +269,6 @@ impl eframe::App for HashGoblinApp {
                     (Tab::Scan, "Scan"),
                     (Tab::Dupes, "Dupes"),
                     (Tab::Find, "Find"),
-                    (Tab::Stats, "Stats"),
                     (Tab::Stale, "Stale"),
                 ] {
                     let sel = self.active_tab == tab;
@@ -271,7 +285,6 @@ impl eframe::App for HashGoblinApp {
             Tab::Scan => show_scan(ui, ctx, &db, &mut self.scan),
             Tab::Dupes => show_dupes(ui, &db, &mut self.dupes),
             Tab::Find => show_find(ui, ctx, &db, &mut self.find),
-            Tab::Stats => show_stats(ui, &db, &mut self.stats),
             Tab::Stale => show_stale(ui, &db, &mut self.stale),
         });
     }
@@ -299,7 +312,20 @@ fn show_scan(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut ScanPanel
     }
     if let Some(r) = finished {
         p.status = match r {
-            Ok(res) => ScanStatus::Done(res),
+            Ok(res) => {
+                // Fetch error details from the DB synchronously; the query is
+                // lightweight and only runs once at scan completion.
+                let error_files = if res.errors > 0 {
+                    db::open(std::path::Path::new(db))
+                        .and_then(|conn| db::query_errors(&conn))
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                // Trigger a stats refresh so the new counts are shown immediately.
+                p.stats_status = StatsStatus::Idle;
+                ScanStatus::Done(res, error_files)
+            }
             Err(e) => ScanStatus::Error(e.to_string()),
         };
     }
@@ -419,7 +445,7 @@ fn show_scan(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut ScanPanel
                 }
             }
         }
-        ScanStatus::Done(res) => {
+        ScanStatus::Done(res, error_files) => {
             if res.cancelled {
                 ui.label(
                     RichText::new("⚠  Scan cancelled — unvisited files marked stale. Re-scan to fix.")
@@ -440,9 +466,113 @@ fn show_scan(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut ScanPanel
                 stat_row(ui, "Errors", res.errors);
                 stat_row(ui, "Stale (marked missing)", res.stale);
             });
+            if !error_files.is_empty() {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("{} file(s) could not be hashed:", error_files.len()))
+                        .strong()
+                        .color(Color32::YELLOW),
+                );
+                ui.add_space(4.0);
+                let row_height = ui.text_style_height(&egui::TextStyle::Monospace)
+                    + ui.spacing().item_spacing.y * 2.0;
+                ScrollArea::vertical()
+                    .id_salt("scan_errors")
+                    .max_height(200.0)
+                    .show_rows(ui, row_height, error_files.len(), |ui, range| {
+                        for (path, err) in &error_files[range] {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(truncate_path(path, 50))
+                                        .monospace()
+                                        .color(Color32::LIGHT_GRAY)
+                                        .small(),
+                                )
+                                .on_hover_text(path.as_str());
+                                ui.label(
+                                    RichText::new(err.as_str())
+                                        .color(Color32::from_rgb(220, 80, 80))
+                                        .small(),
+                                );
+                            });
+                        }
+                    });
+            }
         }
         ScanStatus::Error(e) => {
             ui.label(RichText::new(format!("✖  Error: {}", e)).color(Color32::RED));
+        }
+    }
+
+    // ── Database statistics ───────────────────────────────────────────────
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    // Poll for stats completion.
+    {
+        let mut stats_done: Option<anyhow::Result<Stats>> = None;
+        if let StatsStatus::Loading(ref rx) = p.stats_status {
+            if let Ok(r) = rx.try_recv() {
+                stats_done = Some(r);
+            }
+        }
+        if let Some(r) = stats_done {
+            p.stats_status = match r {
+                Ok(s) => StatsStatus::Done(s),
+                Err(e) => StatsStatus::Error(e.to_string()),
+            };
+        }
+    }
+
+    // Auto-load on Idle (first render, after scan, after Refresh).
+    let stats_loading = matches!(p.stats_status, StatsStatus::Loading(_));
+    let refresh_clicked = {
+        ui.horizontal(|ui| {
+            ui.heading("Database Statistics");
+            ui.add_enabled(!stats_loading, egui::Button::new("Refresh"))
+                .clicked()
+        })
+        .inner
+    };
+    if (matches!(p.stats_status, StatsStatus::Idle) || refresh_clicked) && !stats_loading {
+        let db_path = db.to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = (|| -> anyhow::Result<Stats> {
+                let conn = db::open(std::path::Path::new(&db_path))?;
+                db::query_stats(&conn)
+            })();
+            tx.send(r).ok();
+        });
+        p.stats_status = StatsStatus::Loading(rx);
+    }
+
+    ui.add_space(4.0);
+    match &p.stats_status {
+        StatsStatus::Idle | StatsStatus::Loading(_) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading…");
+            });
+        }
+        StatsStatus::Error(e) => {
+            ui.label(RichText::new(format!("✖  {}", e)).color(Color32::RED));
+        }
+        StatsStatus::Done(s) => {
+            egui::Grid::new("scan_stats_grid")
+                .num_columns(2)
+                .spacing([40.0, 6.0])
+                .show(ui, |ui| {
+                    stat_row(ui, "Total files", s.total_files);
+                    ui.label("Total size:");
+                    ui.label(human_size(s.total_size));
+                    ui.end_row();
+                    stat_row(ui, "Duplicate groups", s.dupe_groups);
+                    stat_row(ui, "Duplicate files", s.dupe_files);
+                    stat_row(ui, "Errors", s.error_count);
+                    stat_row(ui, "Stale", s.stale_count);
+                });
         }
     }
 }
@@ -460,9 +590,66 @@ fn show_dupes(ui: &mut egui::Ui, db: &str, p: &mut DupesPanel) {
         }
         if let Some(r) = finished {
             p.selected_group = None;
+            p.selected_path = None;
             p.status = match r {
                 Ok(groups) => DupesStatus::Done(groups),
                 Err(e) => DupesStatus::Error(e.to_string()),
+            };
+        }
+    }
+
+    // Poll cleanup file dialog
+    #[cfg(feature = "cleanup")]
+    {
+        let mut chosen: Option<Option<PathBuf>> = None;
+        if let Some(ref rx) = p.cleanup_dialog_rx {
+            if let Ok(r) = rx.try_recv() {
+                chosen = Some(r);
+            }
+        }
+        if let Some(opt_path) = chosen {
+            p.cleanup_dialog_rx = None;
+            if let Some(output_path) = opt_path {
+                let db_path = db.to_string();
+                let min_size: u64 = crate::commands::parse_human_size(&p.min_size_str).unwrap_or(1);
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| -> anyhow::Result<String> {
+                        let conn = db::open(std::path::Path::new(&db_path))?;
+                        let groups = db::query_dupes_for_cleanup(&conn, min_size)?;
+                        if groups.is_empty() {
+                            return Ok("No duplicate groups found — nothing written.".to_string());
+                        }
+                        let file = std::fs::File::create(&output_path)?;
+                        let mut writer = std::io::BufWriter::new(file);
+                        let n = crate::cleanup::generate_script(
+                            &groups,
+                            std::path::Path::new(&db_path),
+                            &output_path,
+                            &mut writer,
+                        )?;
+                        Ok(format!("Wrote {} group(s) to {}", n, output_path.display()))
+                    })();
+                    tx.send(result).ok();
+                });
+                p.cleanup_status = CleanupStatus::Running(rx);
+            }
+        }
+    }
+
+    // Poll cleanup generation result
+    #[cfg(feature = "cleanup")]
+    {
+        let mut done: Option<anyhow::Result<String>> = None;
+        if let CleanupStatus::Running(ref rx) = p.cleanup_status {
+            if let Ok(r) = rx.try_recv() {
+                done = Some(r);
+            }
+        }
+        if let Some(r) = done {
+            p.cleanup_status = match r {
+                Ok(msg) => CleanupStatus::Done(msg),
+                Err(e) => CleanupStatus::Error(e.to_string()),
             };
         }
     }
@@ -472,16 +659,20 @@ fn show_dupes(ui: &mut egui::Ui, db: &str, p: &mut DupesPanel) {
     ui.add_space(6.0);
 
     let loading = matches!(p.status, DupesStatus::Loading(_));
+    #[cfg(feature = "cleanup")]
+    let cleanup_busy = matches!(p.cleanup_status, CleanupStatus::Running(_));
 
     ui.horizontal(|ui| {
         ui.label("Min size (bytes):");
         ui.add_enabled(
             !loading,
-            TextEdit::singleline(&mut p.min_size_str).desired_width(100.0),
+            TextEdit::singleline(&mut p.min_size_str)
+                .desired_width(120.0)
+                .hint_text("e.g. 1, 512KB, 1.5MB"),
         );
         if ui.add_enabled(!loading, egui::Button::new("Find Duplicates")).clicked() {
             let db_path = db.to_string();
-            let min_size: u64 = p.min_size_str.parse().unwrap_or(1);
+            let min_size: u64 = crate::commands::parse_human_size(&p.min_size_str).unwrap_or(1);
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<Vec<DupeGroup>> {
@@ -492,7 +683,44 @@ fn show_dupes(ui: &mut egui::Ui, db: &str, p: &mut DupesPanel) {
             });
             p.status = DupesStatus::Loading(rx);
         }
+        #[cfg(feature = "cleanup")]
+        {
+            ui.separator();
+            let gen_btn = ui.add_enabled(
+                !cleanup_busy && !loading,
+                egui::Button::new("Generate Cleanup Script…"),
+            );
+            if gen_btn.clicked() && p.cleanup_dialog_rx.is_none() {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = rfd::FileDialog::new()
+                        .set_title("Save cleanup script")
+                        .add_filter("Shell script", &["sh"])
+                        .save_file();
+                    tx.send(result).ok();
+                });
+                p.cleanup_dialog_rx = Some(rx);
+            }
+            if cleanup_busy {
+                ui.spinner();
+            }
+        }
     });
+
+    // Cleanup status line
+    #[cfg(feature = "cleanup")]
+    match &p.cleanup_status {
+        CleanupStatus::Idle => {}
+        CleanupStatus::Running(_) => {
+            ui.label(RichText::new("Generating script…").color(Color32::GRAY));
+        }
+        CleanupStatus::Done(msg) => {
+            ui.label(RichText::new(format!("✔  {}", msg)).color(Color32::from_rgb(80, 200, 80)));
+        }
+        CleanupStatus::Error(e) => {
+            ui.label(RichText::new(format!("✖  {}", e)).color(Color32::RED));
+        }
+    }
 
     ui.add_space(8.0);
     ui.separator();
@@ -540,6 +768,10 @@ fn show_dupes(ui: &mut egui::Ui, db: &str, p: &mut DupesPanel) {
     ui.add_space(4.0);
 
     // ── Paths side panel ─────────────────────────────────────────────────
+    // Clone the selected path before the closure so it can be displayed in
+    // the footer without conflicting with the mutable borrow of p inside the
+    // scroll area.
+    let dupes_footer_path = p.selected_path.clone();
     egui::SidePanel::right("dupes_paths")
         .min_width(360.0)
         .resizable(true)
@@ -548,21 +780,56 @@ fn show_dupes(ui: &mut egui::Ui, db: &str, p: &mut DupesPanel) {
             if let Some(ref paths) = selected_paths {
                 ui.label(RichText::new(format!("{} paths", paths.len())).strong());
                 ui.add_space(4.0);
+
+                // Footer — declared before the scroll so it claims bottom space first.
+                egui::TopBottomPanel::bottom("dupes_path_footer")
+                    .show_inside(ui, |ui| {
+                        ui.separator();
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            match dupes_footer_path.as_deref() {
+                                None => {
+                                    ui.label(
+                                        RichText::new("Select a file to open it")
+                                            .color(Color32::GRAY),
+                                    );
+                                }
+                                Some(sel) => {
+                                    ui.label(
+                                        RichText::new(truncate_path(sel, 40))
+                                            .monospace()
+                                            .color(Color32::LIGHT_GRAY),
+                                    )
+                                    .on_hover_text(sel);
+                                    if ui.button("Open").clicked() {
+                                        open_path(sel);
+                                    }
+                                    if ui.button("Open Folder").clicked() {
+                                        open_parent(sel);
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                    });
+
                 ScrollArea::vertical()
                     .id_salt("dupes_paths_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for path in paths {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(truncate_path(path, 50))
-                                        .monospace()
-                                        .color(Color32::LIGHT_GRAY),
-                                )
-                                .on_hover_text(path.as_str());
-                                if ui.small_button("Open in App").clicked() { open_path(path); }
-                                if ui.small_button("Open Folder").clicked() { open_parent(path); }
-                            });
+                            let is_selected = p.selected_path.as_deref() == Some(path.as_str());
+                            if ui.selectable_label(
+                                is_selected,
+                                RichText::new(truncate_path(path, 50))
+                                    .monospace()
+                                    .color(Color32::LIGHT_GRAY),
+                            )
+                            .on_hover_text(path.as_str())
+                            .clicked()
+                            {
+                                p.selected_path = Some(path.clone());
+                            }
                         }
                     });
             } else {
@@ -587,6 +854,7 @@ fn show_dupes(ui: &mut egui::Ui, db: &str, p: &mut DupesPanel) {
                 let selected = p.selected_group == Some(i);
                 if ui.selectable_label(selected, label).clicked() {
                     p.selected_group = if selected { None } else { Some(i) };
+                    p.selected_path = None;
                 }
             }
         });
@@ -669,7 +937,17 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
     let input_is_hash = p.input.len() == 64 && p.input.bytes().all(|b| b.is_ascii_hexdigit());
     if !input_is_hash {
         ui.horizontal(|ui| {
-            ui.label("PDQ threshold:");
+            ui.label("PDQ threshold:")
+                .on_hover_text(
+                    "How visually similar two images must be to appear as a match.\n\
+                     PDQ is a perceptual hash: small differences in pixel values produce\n\
+                     hashes that are close together. The threshold is the maximum number\n\
+                     of bits (out of 256) that may differ between two hashes.\n\
+                     \n\
+                     0 = identical images only.\n\
+                     ≤ 31 = near-duplicates (Facebook's recommended default).\n\
+                     Higher values cast a wider net and may include false positives.",
+                );
             ui.add(Slider::new(&mut p.threshold, 0..=256).text("bits"));
         });
     }
@@ -733,15 +1011,6 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
                         .color(Color32::GRAY),
                 )
                 .on_hover_text(path.as_str());
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.small_button("Open in App").clicked() {
-                        open_path(path);
-                    }
-                    if ui.small_button("Open Folder").clicked() {
-                        open_parent(path);
-                    }
-                });
                 ui.add_space(6.0);
 
                 if p.preview_rx.is_some() {
@@ -764,6 +1033,39 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
             } else {
                 ui.label(RichText::new("Select a result to preview.").color(Color32::GRAY));
             }
+        });
+
+    // ── Open footer ──────────────────────────────────────────────────────
+    // Clone selected path before closures below take &mut p.
+    let find_footer_path = p.selected_path.clone();
+    egui::TopBottomPanel::bottom("find_footer")
+        .show_inside(ui, |ui| {
+            ui.separator();
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                match find_footer_path.as_deref() {
+                    None => {
+                        ui.label(
+                            RichText::new("Select a result to open it").color(Color32::GRAY),
+                        );
+                    }
+                    Some(sel) => {
+                        ui.label(
+                            RichText::new(truncate_path(sel, 60))
+                                .monospace()
+                                .color(Color32::LIGHT_GRAY),
+                        )
+                        .on_hover_text(sel);
+                        if ui.button("Open").clicked() {
+                            open_path(sel);
+                        }
+                        if ui.button("Open Folder").clicked() {
+                            open_parent(sel);
+                        }
+                    }
+                }
+            });
+            ui.add_space(2.0);
         });
 
     // ── Results list (remaining space) ───────────────────────────────────
@@ -920,12 +1222,6 @@ fn show_result_row(
                 *preview_rx = Some(rx);
             }
         }
-        if ui.small_button("Open in App").clicked() {
-            open_path(path);
-        }
-        if ui.small_button("Open Folder").clicked() {
-            open_parent(path);
-        }
     });
 }
 
@@ -959,75 +1255,6 @@ fn run_find(input: &str, db_path: &str, threshold: u32) -> anyhow::Result<FindRe
     };
 
     Ok(FindResult { exact, similar, sha256: Some(sha256) })
-}
-
-// ── Stats panel ──────────────────────────────────────────────────────────────
-
-fn show_stats(ui: &mut egui::Ui, db: &str, p: &mut StatsPanel) {
-    let mut done: Option<anyhow::Result<Stats>> = None;
-    if let StatsStatus::Loading(ref rx) = p.status {
-        if let Ok(r) = rx.try_recv() {
-            done = Some(r);
-        }
-    }
-    if let Some(r) = done {
-        p.status = match r {
-            Ok(s) => StatsStatus::Done(s),
-            Err(e) => StatsStatus::Error(e.to_string()),
-        };
-    }
-
-    ui.add_space(8.0);
-    ui.heading("Database Statistics");
-    ui.add_space(6.0);
-
-    let loading = matches!(p.status, StatsStatus::Loading(_));
-    if ui.add_enabled(!loading, egui::Button::new("Refresh")).clicked() {
-        let db_path = db.to_string();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let r = (|| -> anyhow::Result<Stats> {
-                let conn = db::open(std::path::Path::new(&db_path))?;
-                db::query_stats(&conn)
-            })();
-            tx.send(r).ok();
-        });
-        p.status = StatsStatus::Loading(rx);
-    }
-
-    ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(6.0);
-
-    match &p.status {
-        StatsStatus::Idle => {
-            ui.label(RichText::new("Press [Refresh] to load statistics.").color(Color32::GRAY));
-        }
-        StatsStatus::Loading(_) => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Loading…");
-            });
-        }
-        StatsStatus::Error(e) => {
-            ui.label(RichText::new(format!("✖  {}", e)).color(Color32::RED));
-        }
-        StatsStatus::Done(s) => {
-            egui::Grid::new("stats_grid")
-                .num_columns(2)
-                .spacing([40.0, 6.0])
-                .show(ui, |ui| {
-                    stat_row(ui, "Total files", s.total_files);
-                    ui.label("Total size:");
-                    ui.label(human_size(s.total_size));
-                    ui.end_row();
-                    stat_row(ui, "Duplicate groups", s.dupe_groups);
-                    stat_row(ui, "Duplicate files", s.dupe_files);
-                    stat_row(ui, "Errors", s.error_count);
-                    stat_row(ui, "Stale", s.stale_count);
-                });
-        }
-    }
 }
 
 // ── Stale panel ──────────────────────────────────────────────────────────────
@@ -1092,18 +1319,26 @@ fn show_stale(ui: &mut egui::Ui, db: &str, p: &mut StalePanel) {
             } else {
                 ui.label(format!("{} stale file(s):", paths.len()));
                 ui.add_space(4.0);
-                ScrollArea::vertical().id_salt("stale_scroll").show(ui, |ui| {
-                    for path in paths {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(path).monospace().color(Color32::LIGHT_GRAY),
-                            );
-                            if ui.small_button("Open Folder").clicked() {
-                                open_parent(path);
-                            }
-                        });
-                    }
-                });
+                let row_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+                let total = paths.len();
+                ScrollArea::vertical()
+                    .id_salt("stale_scroll")
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_height, total, |ui, range| {
+                        for path in &paths[range] {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(truncate_path(path, 80))
+                                        .monospace()
+                                        .color(Color32::LIGHT_GRAY),
+                                )
+                                .on_hover_text(path.as_str());
+                                if ui.small_button("Open Folder").clicked() {
+                                    open_parent(path);
+                                }
+                            });
+                        }
+                    });
             }
         }
     }

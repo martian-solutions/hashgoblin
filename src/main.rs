@@ -1,4 +1,6 @@
 mod cli;
+#[cfg(feature = "cleanup")]
+mod cleanup;
 mod db;
 mod scan;
 mod commands;
@@ -23,5 +25,7 @@ fn main() -> Result<()> {
         Command::Find { input, db, threshold } => commands::find(input, db, threshold),
         Command::Stats { db } => commands::stats(db),
         Command::Stale { db } => commands::stale(db),
+        #[cfg(feature = "cleanup")]
+        Command::Cleanup { db, output, min_size } => commands::cleanup_script(db, output, min_size),
     }
 }

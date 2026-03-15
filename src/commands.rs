@@ -1,6 +1,8 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
+#[cfg(feature = "cleanup")]
+use crate::cleanup;
 use crate::db;
 use crate::scan;
 
@@ -135,6 +137,25 @@ pub fn stats(db: PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cleanup")]
+pub fn cleanup_script(db_path: PathBuf, output: PathBuf, min_size: u64) -> Result<()> {
+    let conn = db::open(&db_path)?;
+    let groups = db::query_dupes_for_cleanup(&conn, min_size)?;
+    if groups.is_empty() {
+        println!("No duplicate groups found — nothing to write.");
+        return Ok(());
+    }
+
+    let file = std::fs::File::create(&output)?;
+    let mut writer = std::io::BufWriter::new(file);
+    let n = cleanup::generate_script(&groups, &db_path, &output, &mut writer)?;
+
+    println!("Wrote {} group(s) to {}", n, output.display());
+    println!("Review the script before running it:");
+    println!("  bash {}", output.display());
+    Ok(())
+}
+
 pub fn stale(db: PathBuf) -> Result<()> {
     let conn = db::open(&db)?;
     let paths = db::query_stale(&conn)?;
@@ -147,6 +168,43 @@ pub fn stale(db: PathBuf) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parse a human-readable byte count into a `u64`.
+///
+/// Accepts plain integers (`"1024"`) or a number followed by an optional
+/// suffix: `B`, `KB`, `MB`, `GB`, `TB`, `PB` (case-insensitive). Decimal
+/// points are allowed for suffixed values (`"1.5 GB"`). Returns `None` if
+/// the string cannot be parsed.
+///
+/// Examples: `"512"` → 512, `"1KB"` → 1024, `"1.5 MB"` → 1_572_864.
+pub(crate) fn parse_human_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    // Split into numeric prefix and optional suffix.
+    let split = s
+        .find(|c: char| c.is_alphabetic())
+        .unwrap_or(s.len());
+    let num_str = s[..split].trim();
+    let suffix = s[split..].trim().to_uppercase();
+
+    let factor: u64 = match suffix.as_str() {
+        "" | "B"  => 1,
+        "KB"      => 1_024,
+        "MB"      => 1_024 * 1_024,
+        "GB"      => 1_024 * 1_024 * 1_024,
+        "TB"      => 1_024u64 * 1_024 * 1_024 * 1_024,
+        "PB"      => 1_024u64 * 1_024 * 1_024 * 1_024 * 1_024,
+        _         => return None,
+    };
+
+    if suffix.is_empty() || suffix == "B" {
+        // Integer-only for bare bytes to avoid confusion with decimal truncation.
+        num_str.parse::<u64>().ok().map(|n| n * factor)
+    } else {
+        num_str.parse::<f64>().ok().and_then(|f| {
+            if f < 0.0 { None } else { Some((f * factor as f64).round() as u64) }
+        })
+    }
 }
 
 /// Returns true if `s` looks like a SHA-256 hex digest (exactly 64 hex chars).
@@ -205,6 +263,38 @@ mod tests {
     #[test]
     fn looks_like_sha256_rejects_file_path() {
         assert!(!looks_like_sha256("/home/user/image.png"));
+    }
+
+    #[test]
+    fn parse_human_size_plain_bytes() {
+        assert_eq!(parse_human_size("0"), Some(0));
+        assert_eq!(parse_human_size("1"), Some(1));
+        assert_eq!(parse_human_size("1024"), Some(1024));
+    }
+
+    #[test]
+    fn parse_human_size_with_suffix() {
+        assert_eq!(parse_human_size("1KB"),   Some(1_024));
+        assert_eq!(parse_human_size("1 MB"),  Some(1_048_576));
+        assert_eq!(parse_human_size("1GB"),   Some(1_073_741_824));
+        assert_eq!(parse_human_size("1.5 MB"), Some(1_572_864));
+        assert_eq!(parse_human_size("2TB"),   Some(2 * 1_024u64.pow(4)));
+    }
+
+    #[test]
+    fn parse_human_size_case_insensitive() {
+        assert_eq!(parse_human_size("1kb"), Some(1_024));
+        assert_eq!(parse_human_size("1Mb"), Some(1_048_576));
+        assert_eq!(parse_human_size("1gB"), Some(1_073_741_824));
+    }
+
+    #[test]
+    fn parse_human_size_invalid() {
+        assert_eq!(parse_human_size(""),       None);
+        assert_eq!(parse_human_size("abc"),    None);
+        assert_eq!(parse_human_size("1XB"),    None);
+        assert_eq!(parse_human_size("-1"),     None);
+        assert_eq!(parse_human_size("-1MB"),   None);
     }
 
     #[test]

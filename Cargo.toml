@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [features]
 gui = ["dep:eframe", "dep:rfd", "dep:open"]
+cleanup = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -88,6 +88,19 @@ pub enum Command {
         #[arg(long, default_value = "hashgoblin.db")]
         db: PathBuf,
     },
+    /// Generate a bash cleanup script that replaces duplicate files with links
+    #[cfg(feature = "cleanup")]
+    Cleanup {
+        /// Path to write the generated bash script
+        #[arg(long)]
+        output: PathBuf,
+        /// SQLite database path
+        #[arg(long, default_value = "hashgoblin.db")]
+        db: PathBuf,
+        /// Minimum file size to consider (bytes)
+        #[arg(long, default_value_t = 1)]
+        min_size: u64,
+    },
 }
 
 fn num_cpus() -> usize {

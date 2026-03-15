@@ -126,6 +126,59 @@ pub fn mark_stale(conn: &Connection, scan_start: i64) -> Result<u64> {
     Ok(n as u64)
 }
 
+/// Per-file information needed to generate a cleanup script.
+#[cfg(feature = "cleanup")]
+pub struct DupeFileInfo {
+    pub path: String,
+    /// Modification time (seconds since Unix epoch) as stored in the database.
+    /// `None` or `i64::MIN` means mtime was unavailable at scan time.
+    pub mtime: Option<i64>,
+    pub size: u64,
+}
+
+/// Return all files that belong to duplicate groups, grouped by sha256.
+/// Used by the cleanup script generator; includes per-file mtime.
+#[cfg(feature = "cleanup")]
+pub fn query_dupes_for_cleanup(
+    conn: &Connection,
+    min_size: u64,
+) -> Result<Vec<(String, Vec<DupeFileInfo>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.sha256, f.path, f.mtime, f.size
+         FROM files f
+         INNER JOIN (
+             SELECT sha256 FROM files
+             WHERE sha256 IS NOT NULL AND stale = 0 AND size >= ?1
+             GROUP BY sha256 HAVING COUNT(*) > 1
+         ) dups ON f.sha256 = dups.sha256
+         WHERE f.stale = 0
+         ORDER BY f.sha256, f.path",
+    )?;
+
+    let rows = stmt.query_map(params![min_size], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, u64>(3)?,
+        ))
+    })?;
+
+    let mut groups: Vec<(String, Vec<DupeFileInfo>)> = Vec::new();
+    let mut cur_sha = String::new();
+    for row in rows {
+        let (sha256, path, mtime, size) = row?;
+        if sha256 != cur_sha {
+            groups.push((sha256.clone(), Vec::new()));
+            cur_sha = sha256;
+        }
+        if let Some((_, files)) = groups.last_mut() {
+            files.push(DupeFileInfo { path, mtime, size });
+        }
+    }
+    Ok(groups)
+}
+
 pub struct DupeGroup {
     pub sha256: String,
     pub count: u64,
@@ -227,6 +280,16 @@ pub fn query_stats(conn: &Connection) -> Result<Stats> {
         error_count,
         stale_count,
     })
+}
+
+/// Return all non-stale files that have a recorded error, ordered by path.
+/// Each entry is `(path, error_message)`.
+pub fn query_errors(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, error FROM files WHERE error IS NOT NULL AND stale = 0 ORDER BY path",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 pub fn query_stale(conn: &Connection) -> Result<Vec<String>> {
