@@ -2,6 +2,8 @@
 name = "hashgoblin"
 version = "0.1.0"
 edition = "2021"
+description = "Resumable, parallel file hashing and duplicate detection with SHA-256 and PDQ perceptual image hashing"
+license = "LicenseRef-HashGoblin-PublicDomain"
 
 [[bin]]
 name = "hashgoblin"
