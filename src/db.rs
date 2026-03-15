@@ -30,6 +30,11 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     // another terminal) would cause an immediate SQLITE_BUSY failure.
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    // Always migrate on open: CREATE TABLE IF NOT EXISTS is idempotent, and
+    // this ensures commands like `dupes` or `stats` work correctly even if
+    // the user hasn't run `scan` yet (rather than returning a confusing
+    // "no such table: files" error).
+    migrate(&conn)?;
     Ok(conn)
 }
 

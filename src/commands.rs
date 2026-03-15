@@ -17,6 +17,10 @@ pub fn scan(path: PathBuf, db: PathBuf, threads: usize) -> Result<()> {
     println!("  Skipped: {} (unchanged)", result.skipped);
     println!("  Errors:  {}", result.errors);
     println!("  Stale:   {} (marked missing)", result.stale);
+    if result.cancelled {
+        eprintln!("\nWarning: scan was cancelled. Unvisited files have been marked stale.");
+        eprintln!("Run scan again to restore correct stale state.");
+    }
     Ok(())
 }
 
@@ -150,7 +154,7 @@ fn looks_like_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
     let mut size = bytes as f64;
     let mut unit = 0;

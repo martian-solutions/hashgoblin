@@ -49,6 +49,10 @@ pub struct ScanResult {
     pub skipped: u64,
     pub errors: u64,
     pub stale: u64,
+    /// True if the scan was cancelled before visiting all files. Files that
+    /// were not visited will have been incorrectly marked stale; a full
+    /// re-scan is needed to recover.
+    pub cancelled: bool,
 }
 
 /// A work item describing one file to process.
@@ -74,9 +78,9 @@ pub fn run(
     scan_start: i64,
     progress: Option<Arc<ScanProgress>>,
 ) -> Result<ScanResult> {
-    // Open DB on the main thread for migration and cache queries.
+    // Open DB on the main thread for cache queries. Migration is handled
+    // inside db::open, so the schema is always up to date.
     let conn = db::open(db_path)?;
-    db::migrate(&conn)?;
 
     // Collect all walkable files first so we can show a spinner while walking.
     let spinner = ProgressBar::new_spinner();
@@ -119,12 +123,17 @@ pub fn run(
                                 continue;
                             }
                         };
+                        // Use i64::MIN as a sentinel when mtime is unavailable
+                        // (filesystem doesn't support it, or timestamp predates the
+                        // Unix epoch). This ensures a file stored with mtime=i64::MIN
+                        // will not match the cache if mtime becomes readable on the
+                        // next scan, forcing a re-hash rather than silently skipping.
                         let mtime = meta
                             .modified()
                             .ok()
                             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                             .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
+                            .unwrap_or(i64::MIN);
                         if let Some(ref p) = progress {
                             p.walk_count.fetch_add(1, Ordering::Relaxed);
                         }
@@ -258,10 +267,15 @@ pub fn run(
         eprintln!("walk error: {}", e);
     }
 
-    pb.finish_with_message("Scan complete");
+    let was_cancelled = progress
+        .as_ref()
+        .map(|p| p.cancel.load(Ordering::Relaxed))
+        .unwrap_or(false);
+
+    pb.finish_with_message(if was_cancelled { "Scan cancelled" } else { "Scan complete" });
 
     if let Some(ref p) = progress {
-        *p.phase.lock().unwrap() = "done".to_string();
+        *p.phase.lock().unwrap() = if was_cancelled { "cancelled" } else { "done" }.to_string();
     }
 
     // Reopen the connection to obtain a fresh WAL snapshot that includes all
@@ -274,6 +288,7 @@ pub fn run(
         skipped,
         errors,
         stale,
+        cancelled: was_cancelled,
     })
 }
 
@@ -485,8 +500,12 @@ mod tests {
         assert_eq!(r1.skipped, 0);
         assert_eq!(r1.errors, 0);
 
-        // Use t1 + 1 so mark_stale in the second scan doesn't flag the first
-        // scan's files (last_seen = t1) as stale if t2 happened to equal t1.
+        // Use t1 + 1 as a conservative guard: if the two scans happen within
+        // the same second (t2 == t1), skipped files are touched with
+        // last_seen = t2 before mark_stale runs, so they would not be flagged
+        // by the strict < predicate anyway. The +1 makes the invariant
+        // (last_seen == scan_start for all visited files) easier to reason
+        // about in the assertions below.
         let t2 = t1 + 1;
         let r2 = run(file_dir.path(), &db_path, 1, t2, None).unwrap();
         assert_eq!(r2.skipped, 2, "second scan should skip both unchanged files");

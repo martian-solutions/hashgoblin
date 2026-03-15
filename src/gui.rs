@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 
+use crate::commands::human_size;
 use crate::db::{self, DupeGroup, SimilarFile, Stats};
 use crate::scan::{self, ScanProgress, ScanResult};
 
@@ -419,11 +420,19 @@ fn show_scan(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut ScanPanel
             }
         }
         ScanStatus::Done(res) => {
-            ui.label(
-                RichText::new("✔  Scan complete")
-                    .color(Color32::from_rgb(80, 200, 80))
-                    .strong(),
-            );
+            if res.cancelled {
+                ui.label(
+                    RichText::new("⚠  Scan cancelled — unvisited files marked stale. Re-scan to fix.")
+                        .color(Color32::YELLOW)
+                        .strong(),
+                );
+            } else {
+                ui.label(
+                    RichText::new("✔  Scan complete")
+                        .color(Color32::from_rgb(80, 200, 80))
+                        .strong(),
+                );
+            }
             ui.add_space(4.0);
             egui::Grid::new("scan_results").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
                 stat_row(ui, "Hashed", res.processed);
@@ -567,7 +576,7 @@ fn show_dupes(ui: &mut egui::Ui, db: &str, p: &mut DupesPanel) {
     let row_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
     ScrollArea::vertical()
         .id_salt("dupes_scroll")
-        .auto_shrink([false, false]) // task #8: fill panel width so scrollbar is at the edge
+        .auto_shrink([false, false]) // fill panel width so scrollbar is at the edge
         .show_rows(ui, row_height, total, |ui, row_range| {
             for i in row_range {
                 let r = &rows[i];
@@ -678,7 +687,7 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
         p.status = FindStatus::Loading(rx);
         p.selected_path = None;
         p.preview_texture = None;
-        p.preview_rx = None; // task #2: clear any in-flight image load
+        p.preview_rx = None; // clear any in-flight image load
     }
 
     ui.add_space(8.0);
@@ -709,8 +718,6 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
 
     // ── Preview pane (right side panel) ──────────────────────────────────
     // Using SidePanel so the remaining ui keeps a vertical layout for results.
-    // task #1: this replaces the horizontal_top + allocate_ui split that was
-    // causing all result rows to be placed horizontally.
     egui::SidePanel::right("find_preview")
         .min_width(320.0)
         .max_width(420.0)
@@ -873,7 +880,7 @@ fn show_result_row(
             *preview_texture = None;
             // Drop old in-flight load before starting a new one (task #6)
             *preview_rx = None;
-            // task #3: use MIME detection (reads file header) instead of extension check
+            // Use MIME detection (reads file header) instead of extension check.
             let is_image = tree_magic_mini::from_filepath(std::path::Path::new(path))
                 .map(|m| m.starts_with("image/"))
                 .unwrap_or(false);
@@ -913,7 +920,6 @@ fn show_result_row(
                 *preview_rx = Some(rx);
             }
         }
-        // task #7: consistent button labels
         if ui.small_button("Open in App").clicked() {
             open_path(path);
         }
@@ -1111,26 +1117,12 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: u64) {
     ui.end_row();
 }
 
-fn human_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} B", bytes)
-    } else {
-        format!("{:.2} {}", size, UNITS[unit])
-    }
-}
-
 fn truncate_path(path: &str, max: usize) -> String {
     if path.len() <= max {
         path.to_string()
     } else {
-        format!("…{}", &path[path.len().saturating_sub(max - 1)..])
+        let boundary = path.floor_char_boundary(path.len().saturating_sub(max - 1));
+        format!("…{}", &path[boundary..])
     }
 }
 
