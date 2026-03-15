@@ -120,10 +120,17 @@ enum FindStatus {
 struct FindPanel {
     input: String,
     threshold: u32,
+    /// When true, use top_n mode; when false, use threshold mode.
+    use_top_n: bool,
+    top_n: u32,
     status: FindStatus,
     selected_path: Option<String>,
+    /// Preview texture for the selected *result* path.
     preview_rx: Option<mpsc::Receiver<egui::ColorImage>>,
     preview_texture: Option<egui::TextureHandle>,
+    /// Preview texture for the *source* input image (shown for comparison).
+    input_preview_rx: Option<mpsc::Receiver<egui::ColorImage>>,
+    input_texture: Option<egui::TextureHandle>,
     file_dialog_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
 }
 
@@ -132,10 +139,14 @@ impl FindPanel {
         Self {
             input: String::new(),
             threshold: 31,
+            use_top_n: false,
+            top_n: 3,
             status: FindStatus::Idle,
             selected_path: None,
             preview_rx: None,
             preview_texture: None,
+            input_preview_rx: None,
+            input_texture: None,
             file_dialog_rx: None,
         }
     }
@@ -159,13 +170,21 @@ enum StaleStatus {
     Error(String),
 }
 
+enum PurgeStatus {
+    Idle,
+    Running(mpsc::Receiver<anyhow::Result<usize>>),
+    Done(usize),
+    Error(String),
+}
+
 struct StalePanel {
     status: StaleStatus,
+    purge_status: PurgeStatus,
 }
 
 impl StalePanel {
     fn new() -> Self {
-        Self { status: StaleStatus::Idle }
+        Self { status: StaleStatus::Idle, purge_status: PurgeStatus::Idle }
     }
 }
 
@@ -889,14 +908,14 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
         }
     }
 
-    // Poll for image preview load
+    // Poll for result image preview load
     {
         let mut loaded: Option<egui::ColorImage> = None;
         let mut done = false;
         if let Some(ref rx) = p.preview_rx {
             match rx.try_recv() {
                 Ok(img) => { loaded = Some(img); done = true; }
-                Err(mpsc::TryRecvError::Disconnected) => { done = true; } // thread exited (decode failed)
+                Err(mpsc::TryRecvError::Disconnected) => { done = true; }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -904,6 +923,24 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
         if let Some(img) = loaded {
             p.preview_texture =
                 Some(ctx.load_texture("preview", img, egui::TextureOptions::default()));
+        }
+    }
+
+    // Poll for source image preview load
+    {
+        let mut loaded: Option<egui::ColorImage> = None;
+        let mut done = false;
+        if let Some(ref rx) = p.input_preview_rx {
+            match rx.try_recv() {
+                Ok(img) => { loaded = Some(img); done = true; }
+                Err(mpsc::TryRecvError::Disconnected) => { done = true; }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if done { p.input_preview_rx = None; }
+        if let Some(img) = loaded {
+            p.input_texture =
+                Some(ctx.load_texture("input_preview", img, egui::TextureOptions::default()));
         }
     }
 
@@ -933,22 +970,37 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
         }
     });
 
-    // Hide PDQ threshold when input already looks like a raw hash (task #5)
+    // Hide PDQ controls when input already looks like a raw hash.
     let input_is_hash = p.input.len() == 64 && p.input.bytes().all(|b| b.is_ascii_hexdigit());
     if !input_is_hash {
         ui.horizontal(|ui| {
-            ui.label("PDQ threshold:")
+            ui.label("PDQ search mode:");
+            ui.radio_value(&mut p.use_top_n, false, "Within threshold")
                 .on_hover_text(
-                    "How visually similar two images must be to appear as a match.\n\
-                     PDQ is a perceptual hash: small differences in pixel values produce\n\
-                     hashes that are close together. The threshold is the maximum number\n\
-                     of bits (out of 256) that may differ between two hashes.\n\
+                    "Show all images within the specified Hamming distance.\n\
+                     PDQ is a 256-bit perceptual hash; the threshold is the maximum\n\
+                     number of bits that may differ between two hashes.\n\
                      \n\
                      0 = identical images only.\n\
                      ≤ 31 = near-duplicates (Facebook's recommended default).\n\
                      Higher values cast a wider net and may include false positives.",
                 );
-            ui.add(Slider::new(&mut p.threshold, 0..=256).text("bits"));
+            ui.radio_value(&mut p.use_top_n, true, "Top N closest")
+                .on_hover_text(
+                    "Return the N closest images by perceptual similarity regardless\n\
+                     of how similar they are. Useful for confirming that even the\n\
+                     nearest match in the database is genuinely dissimilar from your\n\
+                     source image — i.e. it is not in the data store.",
+                );
+        });
+        ui.horizontal(|ui| {
+            if p.use_top_n {
+                ui.label("N:");
+                ui.add(egui::DragValue::new(&mut p.top_n).range(1..=100).suffix(" results"));
+            } else {
+                ui.label("Threshold:");
+                ui.add(Slider::new(&mut p.threshold, 0..=256).text("bits"));
+            }
         });
     }
 
@@ -958,14 +1010,60 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
         let input = p.input.trim().to_string();
         let db_path = db.to_string();
         let threshold = p.threshold;
+        let top_n = if p.use_top_n { p.top_n as usize } else { 0 };
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            tx.send(run_find(&input, &db_path, threshold)).ok();
+            tx.send(run_find(&input, &db_path, threshold, top_n)).ok();
         });
         p.status = FindStatus::Loading(rx);
         p.selected_path = None;
         p.preview_texture = None;
-        p.preview_rx = None; // clear any in-flight image load
+        p.preview_rx = None;
+        p.input_texture = None;
+        p.input_preview_rx = None;
+
+        // Kick off source image preview load when input is a file path.
+        let input_trimmed = p.input.trim().to_string();
+        let is_hash = input_trimmed.len() == 64
+            && input_trimmed.bytes().all(|b| b.is_ascii_hexdigit());
+        if !is_hash {
+            let path = std::path::Path::new(&input_trimmed);
+            let is_image = tree_magic_mini::from_filepath(path)
+                .map(|m| m.starts_with("image/"))
+                .unwrap_or(false)
+                || {
+                    let ext = path.extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"gif"|"webp"|"bmp"|"tiff"|"tif")
+                };
+            if is_image && path.exists() {
+                let path_owned = input_trimmed.clone();
+                let (itx, irx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    if let Ok(img) = image::open(&path_owned) {
+                        let img = img.to_rgba8();
+                        let (w, h) = img.dimensions();
+                        let (dw, dh) = if w > 512 || h > 512 {
+                            let s = 512.0 / (w.max(h) as f32);
+                            ((w as f32 * s) as u32, (h as f32 * s) as u32)
+                        } else {
+                            (w, h)
+                        };
+                        let img = if (dw, dh) != (w, h) {
+                            image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Triangle)
+                        } else { img };
+                        let (fw, fh) = img.dimensions();
+                        let pixels = img.into_raw();
+                        itx.send(egui::ColorImage::from_rgba_unmultiplied(
+                            [fw as usize, fh as usize], &pixels,
+                        )).ok();
+                    }
+                });
+                p.input_preview_rx = Some(irx);
+            }
+        }
     }
 
     ui.add_space(8.0);
@@ -995,43 +1093,83 @@ fn show_find(ui: &mut egui::Ui, ctx: &egui::Context, db: &str, p: &mut FindPanel
     };
 
     // ── Preview pane (right side panel) ──────────────────────────────────
-    // Using SidePanel so the remaining ui keeps a vertical layout for results.
+    // Collect what we need before the closure borrows p immutably.
+    let has_input_tex = p.input_texture.is_some();
+    let has_input_loading = p.input_preview_rx.is_some();
+    let selected_path_clone = p.selected_path.clone();
+    let has_result_loading = p.preview_rx.is_some();
+
     egui::SidePanel::right("find_preview")
         .min_width(320.0)
         .max_width(420.0)
         .resizable(true)
         .show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new("Preview").strong());
-            ui.add_space(4.0);
-            if let Some(ref path) = p.selected_path.clone() {
-                ui.label(
-                    RichText::new(truncate_path(path, 40))
-                        .monospace()
-                        .color(Color32::GRAY),
-                )
-                .on_hover_text(path.as_str());
-                ui.add_space(6.0);
+            // When we have a source image, split the panel: source on top, match below.
+            // Each half gets at most half the available height.
+            let show_source = has_input_tex || has_input_loading;
+            let show_match = selected_path_clone.is_some() || (!show_source);
 
-                if p.preview_rx.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Loading preview…");
-                    });
-                } else if let Some(ref tex) = p.preview_texture {
-                    let avail = ui.available_size();
-                    let max_w = avail.x - 8.0;
-                    let max_h = (avail.y - 8.0).max(1.0);
+            if show_source {
+                let half_h = (ui.available_height() / 2.0 - 24.0).max(60.0);
+                ui.label(RichText::new("Source").strong());
+                ui.add_space(2.0);
+                if has_input_loading {
+                    ui.horizontal(|ui| { ui.spinner(); ui.label("Loading…"); });
+                } else if let Some(ref tex) = p.input_texture {
+                    let max_w = ui.available_width() - 8.0;
                     let tw = tex.size()[0] as f32;
                     let th = tex.size()[1] as f32;
-                    let scale = (max_w / tw).min(max_h / th).min(1.0);
-                    let size = Vec2::new(tw * scale, th * scale);
-                    ui.image((tex.id(), size));
-                } else {
-                    ui.label(RichText::new("(not an image)").color(Color32::GRAY));
+                    let scale = (max_w / tw).min(half_h / th).min(1.0);
+                    ui.image((tex.id(), Vec2::new(tw * scale, th * scale)));
                 }
-            } else {
-                ui.label(RichText::new("Select a result to preview.").color(Color32::GRAY));
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+            }
+
+            if show_match {
+                // Extract the distance for this selected path from display data.
+                let match_dist: Option<u32> = if let FindStatus::Done(ref res) = p.status {
+                    selected_path_clone.as_deref().and_then(|sel| {
+                        res.similar.iter().find(|s| s.path == sel).map(|s| s.distance)
+                    })
+                } else { None };
+
+                let match_label = match match_dist {
+                    Some(d) => format!(
+                        "Match  {:.1}% similar  ({} bits)",
+                        db::pdq_similarity_pct(d), d
+                    ),
+                    None => "Match".to_string(),
+                };
+                ui.label(RichText::new(match_label).strong());
+                ui.add_space(2.0);
+
+                if let Some(ref path) = selected_path_clone {
+                    ui.label(
+                        RichText::new(truncate_path(path, 40))
+                            .monospace()
+                            .color(Color32::GRAY),
+                    )
+                    .on_hover_text(path.as_str());
+                    ui.add_space(4.0);
+
+                    if has_result_loading {
+                        ui.horizontal(|ui| { ui.spinner(); ui.label("Loading preview…"); });
+                    } else if let Some(ref tex) = p.preview_texture {
+                        let avail = ui.available_size();
+                        let max_w = avail.x - 8.0;
+                        let max_h = (avail.y - 8.0).max(1.0);
+                        let tw = tex.size()[0] as f32;
+                        let th = tex.size()[1] as f32;
+                        let scale = (max_w / tw).min(max_h / th).min(1.0);
+                        ui.image((tex.id(), Vec2::new(tw * scale, th * scale)));
+                    } else {
+                        ui.label(RichText::new("(not an image)").color(Color32::GRAY));
+                    }
+                } else {
+                    ui.label(RichText::new("Select a result to preview.").color(Color32::GRAY));
+                }
             }
         });
 
@@ -1170,7 +1308,7 @@ fn show_result_row(
     ui.horizontal(|ui| {
         let short = truncate_path(path, 60);
         let label = match distance {
-            Some(d) => format!("[{:>3}b] {}", d, short),
+            Some(d) => format!("[{:>5.1}%] {}", db::pdq_similarity_pct(d), short),
             None => short,
         };
         let is_selected = selected_path.as_deref() == Some(path);
@@ -1225,7 +1363,7 @@ fn show_result_row(
     });
 }
 
-fn run_find(input: &str, db_path: &str, threshold: u32) -> anyhow::Result<FindResult> {
+fn run_find(input: &str, db_path: &str, threshold: u32, top_n: usize) -> anyhow::Result<FindResult> {
     let is_hash = input.len() == 64 && input.bytes().all(|b| b.is_ascii_hexdigit());
 
     if is_hash {
@@ -1244,10 +1382,19 @@ fn run_find(input: &str, db_path: &str, threshold: u32) -> anyhow::Result<FindRe
     let conn = db::open(std::path::Path::new(db_path))?;
     let exact = db::query_by_hash(&conn, &sha256)?;
 
+    // Use MIME detection first; fall back to extension for non-standard files.
     let mime = tree_magic_mini::from_filepath(path).unwrap_or("application/octet-stream");
-    let similar = if mime.starts_with("image/") {
+    let is_image = mime.starts_with("image/") || {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        matches!(ext.as_str(), "jpg"|"jpeg"|"png"|"gif"|"webp"|"bmp"|"tiff"|"tif")
+    };
+    let similar = if is_image {
+        let limit = if top_n > 0 { Some(top_n) } else { None };
         match scan::compute_pdq(path) {
-            Some(pdq) => db::query_similar_pdq(&conn, &pdq, threshold)?,
+            Some(pdq) => db::query_similar_pdq(&conn, &pdq, threshold, limit)?,
             None => vec![],
         }
     } else {
@@ -1260,17 +1407,40 @@ fn run_find(input: &str, db_path: &str, threshold: u32) -> anyhow::Result<FindRe
 // ── Stale panel ──────────────────────────────────────────────────────────────
 
 fn show_stale(ui: &mut egui::Ui, db: &str, p: &mut StalePanel) {
-    let mut done: Option<anyhow::Result<Vec<String>>> = None;
-    if let StaleStatus::Loading(ref rx) = p.status {
-        if let Ok(r) = rx.try_recv() {
-            done = Some(r);
+    // Poll stale list load
+    {
+        let mut done: Option<anyhow::Result<Vec<String>>> = None;
+        if let StaleStatus::Loading(ref rx) = p.status {
+            if let Ok(r) = rx.try_recv() {
+                done = Some(r);
+            }
+        }
+        if let Some(r) = done {
+            p.status = match r {
+                Ok(paths) => StaleStatus::Done(paths),
+                Err(e) => StaleStatus::Error(e.to_string()),
+            };
         }
     }
-    if let Some(r) = done {
-        p.status = match r {
-            Ok(paths) => StaleStatus::Done(paths),
-            Err(e) => StaleStatus::Error(e.to_string()),
-        };
+
+    // Poll purge
+    {
+        let mut done: Option<anyhow::Result<usize>> = None;
+        if let PurgeStatus::Running(ref rx) = p.purge_status {
+            if let Ok(r) = rx.try_recv() {
+                done = Some(r);
+            }
+        }
+        if let Some(r) = done {
+            p.purge_status = match r {
+                Ok(n) => {
+                    // Refresh the list to reflect the now-empty stale set.
+                    p.status = StaleStatus::Done(vec![]);
+                    PurgeStatus::Done(n)
+                }
+                Err(e) => PurgeStatus::Error(e.to_string()),
+            };
+        }
     }
 
     ui.add_space(8.0);
@@ -1278,17 +1448,62 @@ fn show_stale(ui: &mut egui::Ui, db: &str, p: &mut StalePanel) {
     ui.add_space(6.0);
 
     let loading = matches!(p.status, StaleStatus::Loading(_));
-    if ui.add_enabled(!loading, egui::Button::new("Refresh")).clicked() {
-        let db_path = db.to_string();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let r = (|| -> anyhow::Result<Vec<String>> {
-                let conn = db::open(std::path::Path::new(&db_path))?;
-                db::query_stale(&conn)
-            })();
-            tx.send(r).ok();
-        });
-        p.status = StaleStatus::Loading(rx);
+    let purging = matches!(p.purge_status, PurgeStatus::Running(_));
+    let has_stale = matches!(&p.status, StaleStatus::Done(paths) if !paths.is_empty());
+
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!loading && !purging, egui::Button::new("Refresh")).clicked() {
+            let db_path = db.to_string();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let r = (|| -> anyhow::Result<Vec<String>> {
+                    let conn = db::open(std::path::Path::new(&db_path))?;
+                    db::query_stale(&conn)
+                })();
+                tx.send(r).ok();
+            });
+            p.status = StaleStatus::Loading(rx);
+            p.purge_status = PurgeStatus::Idle;
+        }
+
+        let purge_btn = ui.add_enabled(
+            has_stale && !purging,
+            egui::Button::new("Purge Stale Records"),
+        );
+        if purge_btn.on_hover_text(
+            "Permanently delete all stale records from the database.\n\
+             This does not touch files on disk — only removes their\n\
+             metadata entries from the HashGoblin database.",
+        ).clicked() {
+            let db_path = db.to_string();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let r = (|| -> anyhow::Result<usize> {
+                    let conn = db::open(std::path::Path::new(&db_path))?;
+                    db::purge_stale(&conn)
+                })();
+                tx.send(r).ok();
+            });
+            p.purge_status = PurgeStatus::Running(rx);
+        }
+
+        if purging { ui.spinner(); }
+    });
+
+    match &p.purge_status {
+        PurgeStatus::Idle => {}
+        PurgeStatus::Running(_) => {
+            ui.label(RichText::new("Purging…").color(Color32::GRAY));
+        }
+        PurgeStatus::Done(n) => {
+            ui.label(
+                RichText::new(format!("✔  Purged {} record(s).", n))
+                    .color(Color32::from_rgb(80, 200, 80)),
+            );
+        }
+        PurgeStatus::Error(e) => {
+            ui.label(RichText::new(format!("✖  {}", e)).color(Color32::RED));
+        }
     }
 
     ui.add_space(8.0);

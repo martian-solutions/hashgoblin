@@ -298,6 +298,13 @@ pub fn query_stale(conn: &Connection) -> Result<Vec<String>> {
     rows.collect::<Result<Vec<String>, _>>().map_err(Into::into)
 }
 
+/// Delete all stale file records from the database.
+/// Returns the number of rows deleted.
+pub fn purge_stale(conn: &Connection) -> Result<usize> {
+    let n = conn.execute("DELETE FROM files WHERE stale = 1", [])?;
+    Ok(n)
+}
+
 /// A file in the database that is perceptually similar to a query image.
 pub struct SimilarFile {
     pub path: String,
@@ -306,12 +313,24 @@ pub struct SimilarFile {
     pub distance: u32,
 }
 
-/// Find all non-stale files whose PDQ hash is within `threshold` bits (Hamming distance)
-/// of `query_hex`. Results are sorted closest-first.
+/// Convert a PDQ Hamming distance to a similarity percentage.
+///
+/// 100.0 = identical (distance 0), 0.0 = maximally different (distance 256).
+/// Facebook's 31-bit near-duplicate threshold ≈ 87.9%.
+pub fn pdq_similarity_pct(distance: u32) -> f32 {
+    (256u32.saturating_sub(distance)) as f32 / 256.0 * 100.0
+}
+
+/// Find non-stale files whose PDQ hash is perceptually close to `query_hex`.
+///
+/// When `limit` is `None`, returns all files within `threshold` bits (Hamming distance),
+/// sorted closest-first. When `limit` is `Some(n)`, `threshold` is ignored and the `n`
+/// closest files across the entire database are returned instead.
 pub fn query_similar_pdq(
     conn: &Connection,
     query_hex: &str,
     threshold: u32,
+    limit: Option<usize>,
 ) -> Result<Vec<SimilarFile>> {
     let query_hash = pdq_hex_to_bytes(query_hex)
         .ok_or_else(|| anyhow::anyhow!("Invalid PDQ hash: {}", query_hex))?;
@@ -323,17 +342,21 @@ pub fn query_similar_pdq(
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
 
+    let effective_threshold = if limit.is_some() { 256 } else { threshold };
     let mut results = Vec::new();
     for row in rows {
         let (path, stored_hex) = row?;
         if let Some(stored_hash) = pdq_hex_to_bytes(&stored_hex) {
             let dist = hamming_distance(&query_hash, &stored_hash);
-            if dist <= threshold {
+            if dist <= effective_threshold {
                 results.push(SimilarFile { path, distance: dist });
             }
         }
     }
     results.sort_by_key(|r| r.distance);
+    if let Some(n) = limit {
+        results.truncate(n);
+    }
     Ok(results)
 }
 
@@ -525,7 +548,7 @@ mod tests {
         let conn = setup();
         upsert(&conn, &make_record("/img", Some("h"), Some(ALL_ZEROS), 1000)).unwrap();
 
-        let results = query_similar_pdq(&conn, ALL_ZEROS, 0).unwrap();
+        let results = query_similar_pdq(&conn, ALL_ZEROS, 0, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "/img");
         assert_eq!(results[0].distance, 0);
@@ -536,8 +559,8 @@ mod tests {
         let conn = setup();
         upsert(&conn, &make_record("/img", Some("h"), Some(DIST_1), 1000)).unwrap();
 
-        assert!(query_similar_pdq(&conn, ALL_ZEROS, 0).unwrap().is_empty());
-        let r = query_similar_pdq(&conn, ALL_ZEROS, 1).unwrap();
+        assert!(query_similar_pdq(&conn, ALL_ZEROS, 0, None).unwrap().is_empty());
+        let r = query_similar_pdq(&conn, ALL_ZEROS, 1, None).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].distance, 1);
     }
@@ -548,7 +571,7 @@ mod tests {
         upsert(&conn, &make_record("/far",  Some("h1"), Some(DIST_8), 1000)).unwrap();
         upsert(&conn, &make_record("/near", Some("h2"), Some(DIST_1), 1000)).unwrap();
 
-        let results = query_similar_pdq(&conn, ALL_ZEROS, 10).unwrap();
+        let results = query_similar_pdq(&conn, ALL_ZEROS, 10, None).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].path, "/near");
         assert_eq!(results[0].distance, 1);
@@ -561,7 +584,7 @@ mod tests {
         let conn = setup();
         upsert(&conn, &make_record("/stale_img", Some("h"), Some(ALL_ZEROS), 100)).unwrap();
         mark_stale(&conn, 500).unwrap();
-        assert!(query_similar_pdq(&conn, ALL_ZEROS, 256).unwrap().is_empty());
+        assert!(query_similar_pdq(&conn, ALL_ZEROS, 256, None).unwrap().is_empty());
     }
 
     #[test]

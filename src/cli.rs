@@ -73,8 +73,15 @@ pub enum Command {
         /// Maximum PDQ Hamming distance to consider a perceptual match (0–256).
         /// Only used when INPUT is an image file path. The PDQ paper treats ≤ 31
         /// as "near-duplicate"; raise this value to cast a wider net.
+        /// Ignored when --top is set.
         #[arg(long, default_value_t = 31)]
         threshold: u32,
+        /// Return the N closest perceptual matches regardless of threshold.
+        /// When set, --threshold is ignored and all images in the database are
+        /// ranked by similarity; the N closest are shown. Use 0 (default) to
+        /// use --threshold filtering instead.
+        #[arg(long, default_value_t = 0)]
+        top: usize,
     },
     /// Show summary statistics
     Stats {
@@ -87,6 +94,9 @@ pub enum Command {
         /// SQLite database path
         #[arg(long, default_value = "hashgoblin.db")]
         db: PathBuf,
+        /// Delete all stale records from the database after listing them
+        #[arg(long)]
+        purge: bool,
     },
     /// Generate a bash cleanup script that replaces duplicate files with links
     #[cfg(feature = "cleanup")]

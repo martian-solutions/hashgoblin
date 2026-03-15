@@ -56,7 +56,7 @@ pub fn dupes(db: PathBuf, min_size: u64) -> Result<()> {
 /// - A file path on disk → returns exact SHA-256 duplicates for any file type,
 ///   plus perceptually similar images (PDQ hash, Hamming distance ≤ `threshold`)
 ///   when the input is an image.
-pub fn find(input: String, db: PathBuf, threshold: u32) -> Result<()> {
+pub fn find(input: String, db: PathBuf, threshold: u32, top: usize) -> Result<()> {
     if looks_like_sha256(&input) {
         // Normalise to lowercase: SHA-256 hashes are stored as lowercase by
         // sha2, but SQLite TEXT comparison is case-sensitive, so an uppercase
@@ -96,25 +96,44 @@ pub fn find(input: String, db: PathBuf, threshold: u32) -> Result<()> {
     }
 
     // Perceptual similarity search for images.
+    // Use MIME detection first; fall back to file extension for formats that
+    // trip up magic-byte detection (e.g. JPEGs with non-standard preambles).
     let mime = tree_magic_mini::from_filepath(&path).unwrap_or("application/octet-stream");
-    if mime.starts_with("image/") {
+    let is_image = mime.starts_with("image/") || {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tiff" | "tif")
+    };
+    if is_image {
         println!();
         match scan::compute_pdq(&path) {
             None => {
                 println!("Could not compute PDQ hash for this image (unsupported format or corrupt file).");
             }
             Some(pdq_hex) => {
-                let similar = db::query_similar_pdq(&conn, &pdq_hex, threshold)?;
+                let limit = if top > 0 { Some(top) } else { None };
+                let similar = db::query_similar_pdq(&conn, &pdq_hex, threshold, limit)?;
                 if similar.is_empty() {
-                    println!("No perceptually similar images found (threshold: {} bits).", threshold);
+                    if top > 0 {
+                        println!("No images with PDQ hashes found in the database.");
+                    } else {
+                        println!("No perceptually similar images found (threshold: {} bits).", threshold);
+                    }
                 } else {
-                    println!(
-                        "{} perceptually similar image(s) (PDQ threshold: ≤ {} bits):\n",
-                        similar.len(),
-                        threshold
-                    );
+                    if top > 0 {
+                        println!("Top {} closest image(s) by PDQ perceptual hash:\n", similar.len());
+                    } else {
+                        println!(
+                            "{} perceptually similar image(s) (PDQ threshold: ≤ {} bits):\n",
+                            similar.len(),
+                            threshold
+                        );
+                    }
                     for s in &similar {
-                        println!("  [{:>3} bits] {}", s.distance, s.path);
+                        let pct = db::pdq_similarity_pct(s.distance);
+                        println!("  [{:>5.1}% | {:>3} bits]  {}", pct, s.distance, s.path);
                     }
                 }
             }
@@ -156,7 +175,7 @@ pub fn cleanup_script(db_path: PathBuf, output: PathBuf, min_size: u64) -> Resul
     Ok(())
 }
 
-pub fn stale(db: PathBuf) -> Result<()> {
+pub fn stale(db: PathBuf, purge: bool) -> Result<()> {
     let conn = db::open(&db)?;
     let paths = db::query_stale(&conn)?;
     if paths.is_empty() {
@@ -165,6 +184,10 @@ pub fn stale(db: PathBuf) -> Result<()> {
         println!("{} stale file(s):", paths.len());
         for p in &paths {
             println!("  {}", p);
+        }
+        if purge {
+            let n = db::purge_stale(&conn)?;
+            println!("\nPurged {} stale record(s) from the database.", n);
         }
     }
     Ok(())
