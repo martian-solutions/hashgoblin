@@ -12,6 +12,9 @@ use clap::Parser;
 use cli::{Cli, Command};
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     // Launch the GUI when built with the `gui` feature and no subcommand is given.
     #[cfg(feature = "gui")]
     if std::env::args().len() == 1 {

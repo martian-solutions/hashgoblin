@@ -29,7 +29,6 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     // the default timeout is 0 ms: any concurrent reader (e.g. `sqlite3` in
     // another terminal) would cause an immediate SQLITE_BUSY failure.
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     // Always migrate on open: CREATE TABLE IF NOT EXISTS is idempotent, and
     // this ensures commands like `dupes` or `stats` work correctly even if
     // the user hasn't run `scan` yet (rather than returning a confusing

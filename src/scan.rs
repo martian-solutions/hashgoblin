@@ -1,10 +1,11 @@
 use anyhow::Result;
+use tracing::{debug, warn};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -387,7 +388,19 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 /// compute and store the hash regardless of quality — callers can decide how
 /// much weight to give low-quality results.
 pub fn compute_pdq(path: &Path) -> Option<String> {
-    let img = image::open(path).ok()?;
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => { warn!(?path, error = %e, "pdq: failed to open file"); return None; }
+    };
+    let reader = match image::io::Reader::new(BufReader::new(file)).with_guessed_format() {
+        Ok(r) => r,
+        Err(e) => { warn!(?path, error = %e, "pdq: failed to guess format"); return None; }
+    };
+    debug!(?path, format = ?reader.format(), "pdq: detected format");
+    let img = match reader.decode() {
+        Ok(i) => i,
+        Err(e) => { warn!(?path, error = %e, "pdq: decode failed"); return None; }
+    };
     let (hash_bytes, _quality) = pdqhash::generate_pdq_full_size(&img);
     Some(pdq_bytes_to_hex(&hash_bytes))
 }
